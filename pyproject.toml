@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quaternion-transformer"
+version = "0.0.1"
+description = "Quaternion-valued parameterization of pretrained Transformer linear layers, with LoRA recovery and hardware-aware kernels."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.4",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+hf = ["transformers>=4.40", "accelerate>=0.30", "datasets>=2.18", "peft>=0.10"]
+
+[tool.setuptools]
+packages = ["quaternion"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
