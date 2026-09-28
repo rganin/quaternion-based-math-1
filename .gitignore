@@ -9,3 +9,6 @@ dist/
 *.safetensors
 experiments/results/*
 !experiments/results/.gitkeep
+experiments/logs/*
+!experiments/logs/.gitkeep
+*.pid

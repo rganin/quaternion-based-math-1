@@ -35,7 +35,7 @@ def build_args(hidden, tokens, dtype, device, seed=0):
     return x, w, block
 
 
-def build_specs(x, w, block, dtype, use_triton, use_compile):
+def build_specs(x, w, block, dtype, use_triton, use_compile, use_cuda=False):
     """Return {name: (fn, args)} for every available operator."""
     specs = {
         "dense": (dense_gemm, (x, block)),
@@ -64,6 +64,14 @@ def build_specs(x, w, block, dtype, use_triton, use_compile):
         compiled = torch.compile(quaternion_linear)
         specs["compile"] = (compiled, (x, *w))
 
+    if use_cuda and x.is_cuda:
+        try:
+            from kernels.cuda.loader import quaternion_linear_cuda
+
+            specs["cuda"] = (quaternion_linear_cuda, (x, *w))
+        except Exception as exc:  # pragma: no cover
+            print(f"[benchmark] CUDA kernel unavailable: {exc}")
+
     return specs
 
 
@@ -78,6 +86,7 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--triton", action="store_true", help="include fused Triton kernel")
     parser.add_argument("--compile", action="store_true", help="include torch.compile")
+    parser.add_argument("--cuda", action="store_true", help="include custom fused CUDA kernel")
     parser.add_argument("--no-save", action="store_true")
     args = parser.parse_args()
 
@@ -90,6 +99,8 @@ def main() -> None:
         names.append("triton")
     if args.compile:
         names.append("compile")
+    if args.cuda:
+        names.append("cuda")
     header = f"{'regime':>8} {'tokens':>8} " + " ".join(
         f"{n + '_ms':>11}" for n in names
     ) + f"{'tri/dense':>11}"
@@ -105,7 +116,7 @@ def main() -> None:
 
         for regime, xr in regimes.items():
             specs = build_specs(
-                xr, w, block, dtype, args.triton, args.compile
+                xr, w, block, dtype, args.triton, args.compile, args.cuda
             )
             results = {
                 name: benchmark_operator(
@@ -116,7 +127,8 @@ def main() -> None:
             dense_ms = results["dense"]["latency_ms_mean"]
             row = f"{regime:>8} {xr.shape[0]:>8} "
             row += " ".join(
-                f"{results[n]['latency_ms_mean']:>11.4f}" for n in names
+                f"{results[n]['latency_ms_mean']:>11.4f}" if n in results else f"{'n/a':>11}"
+                for n in names
             )
             tri_ms = results.get("triton", results["dense"])["latency_ms_mean"]
             row += f"{tri_ms / dense_ms:>11.2f}"

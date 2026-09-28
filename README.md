@@ -71,10 +71,30 @@ extended hypotheses:
 | -- | Factorized quaternion weights (H8) | **done** |
 | -- | Unit-quaternion weights (H9) | **done** |
 | -- | Reconstruction metrics + experiment tracking | **done** |
-| 3 | Block reconstruction | not started |
-| 4/8 | Full 1B conversion | not started |
-| 5/11 | Kernel benchmarks | PyTorch + fused Triton done; CUTLASS/CuTe pending |
-| 6/18 | LoRA recovery | not started |
+| 3 | Block reconstruction | not started (full GPT-2 conversion done instead) |
+| 4/8 | Full-model conversion | done on GPT-2 small (E6) and Qwen2.5-1.5B (E8b) |
+| 5/11 | Kernel benchmarks | PyTorch + Triton + custom CUDA done; CUTLASS/CuTe pending |
+| 6/18 | LoRA recovery | done on GPT-2 small (E7/E7b/E7c); quality mostly recovered |
+
+## Results so far
+
+See [`experimentation_log.md`](experimentation_log.md) for full tables and
+commands. Headline results on GPT-2 small (124M):
+
+- Quaternion weight projection is capped at ≈0.866 relative error (a hard
+  subspace floor), architecture-independent (GPT-2 and Qwen2.5 both 0.8660);
+  channel grouping cannot improve it (E4, E8).
+- Activation-aware fitting reduces per-layer error to ≈0.65 (GPT-2, E5) and
+  ≈0.53 (Qwen2.5, E8); still too high unaided, but architecture/layer-dependent.
+- Full conversion on GPT-2: perplexity 59.4 → 83 663 (matrix) / 7 971
+  (activation) (E6); Qwen2.5-1.5B: 17.8 → 553 655 / 41 350 (E8b).
+- LoRA recovery: 7 971 → 448 at 400 steps (E7) → **160** at 3 000 steps/rank 32
+  (E7b), closing ~80% of the NLL gap but still 2.7× baseline perplexity.
+- A 6.2× worse base (sequential calibration, 49 603) still recovers to the same
+  ≈160 (E7c): LoRA budget, not base quality, is the binding constraint.
+- Fused kernels: Triton is 3–4× faster than naive but slower than cuBLAS;
+  a custom CUDA kernel **beats Triton in decode** (0.040 vs 0.049 ms) but loses
+  in prefill (E1, E9). CUTLASS/CuTe remains pending.
 
 ## Reconstruction
 

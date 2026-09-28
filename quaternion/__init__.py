@@ -8,6 +8,7 @@ from .attention import (
 )
 from .factorized import FactorizedQuaternionLinear, parameter_count
 from .linear import QuaternionLinear, quaternion_linear
+from .lora import LoRAQuaternionLinear, inject_lora, lora_parameters
 from .metrics import (
     cosine_similarity,
     max_abs_error,
@@ -55,6 +56,10 @@ __all__ = [
     # unit quaternion
     "UnitQuaternionLinear",
     "normalize_quaternion",
+    # lora
+    "LoRAQuaternionLinear",
+    "inject_lora",
+    "lora_parameters",
     # metrics
     "mse",
     "rmse",

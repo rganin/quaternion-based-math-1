@@ -61,6 +61,37 @@ def test_adamw_reduces_loss_and_converges_on_block_matrix():
     assert result.metrics["relative_frobenius_error"] < 0.05
 
 
+def test_random_matrix_projection_hits_theoretical_floor():
+    # The quaternion block matrices form a subspace of dimension out*in/4
+    # inside R^{out*in}, so an isotropic matrix has expected squared relative
+    # projection error 3/4 (relative error sqrt(3/4) ~ 0.866).  Any permutation
+    # is orthogonal and cannot beat it.
+    torch.manual_seed(0)
+    w = torch.randn(64, 64)
+    rel = reconstruct_matrix(w, method="projection").metrics[
+        "relative_frobenius_error"
+    ]
+    assert abs(rel - (3 / 4) ** 0.5) < 0.02
+    assert abs(rel - 0.866) < 0.02
+
+
+def test_learned_permutation_is_valid_and_not_worse_than_contiguous():
+    torch.manual_seed(0)
+    w = torch.randn(16, 16)
+    contiguous = reconstruct_matrix(w, method="projection")
+    learned = reconstruct_matrix(w, method="learned", learn_iters=40, seed=0)
+    assert torch.equal(
+        learned.in_permutation.sort().values, torch.arange(16)
+    )
+    assert torch.equal(
+        learned.out_permutation.sort().values, torch.arange(16)
+    )
+    assert (
+        learned.metrics["relative_frobenius_error"]
+        <= contiguous.metrics["relative_frobenius_error"] + 5e-3
+    )
+
+
 def test_random_grouping_records_permutations_and_is_sane():
     g = torch.Generator().manual_seed(1)
     weight = torch.randn(16, 20, generator=g)

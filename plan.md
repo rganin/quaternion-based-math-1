@@ -2384,3 +2384,75 @@ especially efficient during decode
 ```
 
 This is a much stronger research objective than compression alone.
+
+---
+
+# 58. Experiment Execution Conventions
+
+The pipelines in this project (model downloads, calibration collection, layer
+and block fitting, full-model conversion, kernel builds) are long-running.
+They must not be executed under a whole-command timeout that can kill a
+legitimate experiment mid-run.
+
+## Rules
+
+1. **Never wrap a long pipeline in a global command timeout.**
+   Do not run `timeout N python ...` for training, conversion, calibration or
+   kernel-build jobs. A slow but healthy run must be allowed to finish.
+
+2. **Always run long jobs in the background.**
+   Launch with output redirected to a log file and run detached, e.g.:
+
+   ```bash
+   mkdir -p experiments/logs
+   nohup python scripts/reconstruct_model.py --model gpt2 \
+       > experiments/logs/<experiment_id>.log 2>&1 &
+   echo $! > experiments/logs/<experiment_id>.pid
+   ```
+
+   Alternatively use `setsid ... &` or a terminal multiplexer (the environment
+   runs in tmux) so the job survives disconnection.
+
+3. **Poll, do not block.**
+   Check progress every few minutes instead of waiting on a single blocking
+   call. Inspect the pid, the tail of the log, and generated artifacts:
+
+   ```bash
+   ps -p "$(cat experiments/logs/<experiment_id>.pid)"
+   tail -n 40 experiments/logs/<experiment_id>.log
+   ls -lt experiments/results | head
+   ```
+
+4. **Make runs resumable and checkpointed.**
+   Long conversions must checkpoint after every layer/block and support resume
+   (sections 23-25). A killed or preempted job should resume rather than
+   restart.
+
+5. **Log everything to files and to JSON.**
+   Stdout/stderr go to `experiments/logs/`; machine-readable metrics go to
+   `experiments/results/`. `experimentation_log.md` records the command, the
+   log path, the pid, and the result.
+
+6. **Bound sub-steps only where safe.**
+   A timeout may be applied to a genuinely bounded, quick probe (e.g. a
+   connectivity check), never to the experiment itself. Prefer internal
+   iteration/epoch limits and graceful checkpointing over an external kill.
+
+7. **Respect the environment.**
+   Keep LM Studio and the existing Docker images running; do not reclaim
+   their resources unless explicitly asked. Monitor unified memory and disk
+   before launching a new large job.
+
+## Recording
+
+For every experiment, `experimentation_log.md` should capture:
+
+```text
+experiment_id
+command (background form)
+log path
+pid
+start / end (or still running)
+artifacts (results JSON, checkpoints)
+summary of results
+```

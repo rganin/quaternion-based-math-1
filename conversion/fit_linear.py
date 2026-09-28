@@ -32,6 +32,17 @@ __all__ = [
 ]
 
 
+def _project_raw(
+    w: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Differentiable projection in the input's own dtype/device."""
+    wr = (w[0::4, 0::4] + w[1::4, 1::4] + w[2::4, 2::4] + w[3::4, 3::4]) / 4
+    wi = (-w[0::4, 1::4] + w[1::4, 0::4] - w[2::4, 3::4] + w[3::4, 2::4]) / 4
+    wj = (-w[0::4, 2::4] + w[1::4, 3::4] + w[2::4, 0::4] - w[3::4, 1::4]) / 4
+    wk = (-w[0::4, 3::4] - w[1::4, 2::4] + w[2::4, 1::4] + w[3::4, 0::4]) / 4
+    return wr, wi, wj, wk
+
+
 def project_onto_quaternion(
     weight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -46,12 +57,7 @@ def project_onto_quaternion(
     out_features, in_features = weight.shape
     check_divisible(out_features, "out_features")
     check_divisible(in_features, "in_features")
-    w = weight.double()
-    wr = (w[0::4, 0::4] + w[1::4, 1::4] + w[2::4, 2::4] + w[3::4, 3::4]) / 4
-    wi = (-w[0::4, 1::4] + w[1::4, 0::4] - w[2::4, 3::4] + w[3::4, 2::4]) / 4
-    wj = (-w[0::4, 2::4] + w[1::4, 3::4] + w[2::4, 0::4] - w[3::4, 1::4]) / 4
-    wk = (-w[0::4, 3::4] - w[1::4, 2::4] + w[2::4, 1::4] + w[3::4, 0::4]) / 4
-    return wr, wi, wj, wk
+    return _project_raw(weight.double())
 
 
 @dataclass
@@ -96,6 +102,83 @@ def _permute_rows_cols(weight, in_perm, out_perm):
     return weight
 
 
+def _sinkhorn(logits: torch.Tensor, n_iters: int, tau: float) -> torch.Tensor:
+    """Doubly-stochastic relaxation of a permutation (log-domain Sinkhorn)."""
+    x = logits / tau
+    for _ in range(n_iters):
+        x = x - torch.logsumexp(x, dim=1, keepdim=True)
+        x = x - torch.logsumexp(x, dim=0, keepdim=True)
+    return x.exp()
+
+
+def _round_perm(p: torch.Tensor) -> torch.Tensor:
+    """Round a near-permutation matrix to an index permutation via Hungarian."""
+    try:
+        from scipy.optimize import linear_sum_assignment
+
+        rows, cols = linear_sum_assignment(-p.detach().cpu().numpy())
+        return torch.as_tensor(cols, dtype=torch.long)
+    except ImportError:  # pragma: no cover - scipy normally available
+        return p.detach().argmax(dim=1)
+
+
+def _learn_permutation(
+    weight: torch.Tensor,
+    iters: int,
+    lr: float,
+    tau_start: float,
+    tau_end: float,
+    sinkhorn_iters: int,
+    seed: int,
+    device,
+):
+    """Learn input/output channel permutations that make ``weight`` better
+    approximated by a quaternion block matrix.
+
+    Permutations are relaxed to doubly-stochastic matrices (Sinkhorn) and the
+    quaternion projection is applied in closed form inside the loop, so the
+    loss is exactly the residual after optimal quaternionization.  The best
+    iterate is rounded to a hard permutation with the Hungarian algorithm.
+    """
+    out_features, in_features = weight.shape
+    dev = torch.device(device) if device is not None else weight.device
+    w = weight.detach().to(device=dev, dtype=torch.float32)
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+
+    def init_logits(n):
+        noise = 0.01 * torch.randn(n, n, generator=gen)
+        return (torch.eye(n) * 5.0 + noise).to(dev).requires_grad_(True)
+
+    logit_in = init_logits(in_features)
+    logit_out = init_logits(out_features)
+    opt = torch.optim.Adam([logit_in, logit_out], lr=lr)
+
+    best = None
+    history: list[float] = []
+    for it in range(iters):
+        frac = it / max(1, iters - 1)
+        tau = tau_start * (tau_end / tau_start) ** frac
+        p_in = _sinkhorn(logit_in, sinkhorn_iters, tau)
+        p_out = _sinkhorn(logit_out, sinkhorn_iters, tau)
+        w_perm = p_out @ w @ p_in.t()
+        wq = _project_raw(w_perm)
+        block = build_block_matrix(*wq)
+        loss = torch.nn.functional.mse_loss(block, w_perm)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        history.append(loss.item())
+        if best is None or loss.item() < best[0]:
+            best = (loss.item(), p_in.detach().clone(), p_out.detach().clone())
+
+    _, p_in, p_out = best
+    return {
+        "in_perm": _round_perm(p_in),
+        "out_perm": _round_perm(p_out),
+        "history": history,
+    }
+
+
 def _result(
     wr, wi, wj, wk, target, method, seconds, history, in_perm, out_perm, extras=None
 ) -> ReconstructionResult:
@@ -130,34 +213,65 @@ def reconstruct_matrix(
     grouping: str = "contiguous",
     seed: int = 0,
     dtype: torch.dtype = torch.float32,
+    learn_iters: int = 150,
+    learn_lr: float = 0.05,
+    tau_start: float = 1.0,
+    tau_end: float = 0.1,
+    sinkhorn_iters: int = 20,
+    device=None,
 ) -> ReconstructionResult:
     """Approximate ``weight`` with a quaternion block matrix.
 
     ``method='projection'`` uses the closed-form optimum.  ``method='adamw'``
-    runs the plan's AdamW optimization and records the loss history.
+    runs the plan's AdamW optimization.  ``method='learned'`` additionally
+    learns input/output channel permutations (plan.md section 4.3) to improve
+    the grouping before the closed-form projection.
     """
-    if method not in ("projection", "adamw"):
-        raise ValueError("method must be 'projection' or 'adamw'")
+    if method not in ("projection", "adamw", "learned"):
+        raise ValueError("method must be 'projection', 'adamw' or 'learned'")
     if weight.dim() != 2:
         raise ValueError("weight must be 2D [out, in]")
     out_features, in_features = weight.shape
     check_divisible(out_features, "out_features")
     check_divisible(in_features, "in_features")
 
-    generator = torch.Generator().manual_seed(seed)
-    in_perm, out_perm = _make_grouping(
-        in_features, out_features, grouping, generator
-    )
-    target = _permute_rows_cols(weight.detach().double(), in_perm, out_perm)
-
     start = time.perf_counter()
-    if method == "projection":
-        wr, wi, wj, wk = project_onto_quaternion(target)
-        history = []
-    else:
-        wr, wi, wj, wk, history = _optimize_block(
-            target, iters=iters, lr=lr, weight_decay=weight_decay, seed=seed
+    if method == "learned":
+        learned = _learn_permutation(
+            weight.detach(),
+            iters=learn_iters,
+            lr=learn_lr,
+            tau_start=tau_start,
+            tau_end=tau_end,
+            sinkhorn_iters=sinkhorn_iters,
+            seed=seed,
+            device=device,
         )
+        in_perm, out_perm = learned["in_perm"], learned["out_perm"]
+        target = _permute_rows_cols(weight.detach().double(), in_perm, out_perm)
+        wr, wi, wj, wk = project_onto_quaternion(target)
+        history = learned["history"]
+        extras = {
+            "grouping": "learned",
+            "learn_iters": learn_iters,
+            "learn_lr": learn_lr,
+            "tau_start": tau_start,
+            "tau_end": tau_end,
+        }
+    else:
+        generator = torch.Generator().manual_seed(seed)
+        in_perm, out_perm = _make_grouping(
+            in_features, out_features, grouping, generator
+        )
+        target = _permute_rows_cols(weight.detach().double(), in_perm, out_perm)
+        if method == "projection":
+            wr, wi, wj, wk = project_onto_quaternion(target)
+            history = []
+        else:
+            wr, wi, wj, wk, history = _optimize_block(
+                target, iters=iters, lr=lr, weight_decay=weight_decay, seed=seed
+            )
+        extras = {"grouping": grouping, "iters": iters, "lr": lr}
     seconds = time.perf_counter() - start
 
     return _result(
@@ -171,7 +285,7 @@ def reconstruct_matrix(
         history,
         in_perm,
         out_perm,
-        extras={"grouping": grouping, "iters": iters, "lr": lr},
+        extras=extras,
     )
 
 
@@ -182,9 +296,14 @@ def reconstruct_from_activations(
     lr: float = 1e-2,
     weight_decay: float = 0.0,
     seed: int = 0,
-    dtype: torch.dtype = torch.float32,
+    dtype: torch.dtype = torch.float64,
+    device: torch.device | str | None = None,
 ) -> ReconstructionResult:
-    """Activation-aware reconstruction: fit ``QuaternionLinear(X) ≈ Y``."""
+    """Activation-aware reconstruction: fit ``QuaternionLinear(X) ≈ Y``.
+
+    ``dtype`` defaults to float64 for stable reference fits; pass
+    ``torch.float32`` and a CUDA ``device`` for fast large-scale runs.
+    """
     if x.dim() < 2 or y.dim() < 2:
         raise ValueError("x and y must have at least 2 dimensions")
     in_features = x.shape[-1]
@@ -194,8 +313,8 @@ def reconstruct_from_activations(
     if x.shape[:-1] != y.shape[:-1]:
         raise ValueError("x and y must share leading dimensions")
 
-    xd = x.reshape(-1, in_features).double()
-    yd = y.reshape(-1, out_features).double()
+    xd = x.reshape(-1, in_features).to(device=device, dtype=dtype)
+    yd = y.reshape(-1, out_features).to(device=device, dtype=dtype)
 
     start = time.perf_counter()
     wr, wi, wj, wk, history = _optimize_linear(
@@ -223,12 +342,16 @@ def reconstruct_from_activations(
     )
 
 
-def _init_components(out_g, in_g, dtype, seed, generator=None):
-    g = generator or torch.Generator().manual_seed(seed)
+def _init_components(out_g, in_g, dtype, seed, device=None):
+    g = torch.Generator(device="cpu").manual_seed(seed)
     scale = 1.0 / (in_g) ** 0.5
     comps = []
     for _ in range(4):
-        t = (torch.randn(out_g, in_g, generator=g, dtype=torch.float64) * scale)
+        t = (
+            torch.randn(out_g, in_g, generator=g, dtype=torch.float64)
+            .to(dtype=dtype, device=device)
+            * scale
+        )
         t.requires_grad_(True)
         comps.append(t)
     return comps
@@ -253,7 +376,7 @@ def _optimize_block(target, iters, lr, weight_decay, seed):
 def _optimize_linear(x, y, iters, lr, weight_decay, seed):
     out_g = y.shape[1] // 4
     in_g = x.shape[1] // 4
-    params = _init_components(out_g, in_g, y.dtype, seed)
+    params = _init_components(out_g, in_g, y.dtype, seed, device=y.device)
     opt = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
     history: list[float] = []
     for _ in range(iters):
